@@ -36,6 +36,7 @@
 -record(state, {host, port, pass, db, sock, queue, subscriber, cancelled, acc, buffer, reconnect}).
 
 -define(TIMEOUT, 30000).
+-define(CMD_TIMEOUT, 15000).
 
 -spec start_link() -> {ok, pid()} | {error, term()}.
 start_link() ->
@@ -75,7 +76,7 @@ cmd(NameOrPid, Cmd, Timeout) when is_integer(Timeout); Timeout =:= infinity ->
 
     %% send the commands and receive back
     %% unique refs for each packet sent
-    Refs = gen_server:call(NameOrPid, {cmd, Packets}, 2000),
+    Refs = gen_server:call(NameOrPid, {cmd, Packets}, ?CMD_TIMEOUT),
     receive_resps(NameOrPid, Refs, Timeout).
 
 async_cmd(Cmd) ->
@@ -116,7 +117,7 @@ subscribe(Channel) ->
 -spec subscribe(atom() | pid(), list() | binary()) -> reference() | {error, term()}.
 subscribe(NameOrPid, Channel) ->
     Packet = redo_redis_proto:package(["SUBSCRIBE", Channel]),
-    gen_server:call(NameOrPid, {subscribe, Packet}, 2000).
+    gen_server:call(NameOrPid, {subscribe, Packet}, ?CMD_TIMEOUT).
 
 shutdown(NameOrPid) ->
     gen_server:cast(NameOrPid, shutdown).
