@@ -376,6 +376,7 @@ auth(Sock, Pass) ->
         ok ->
             case gen_tcp:recv(Sock, 0) of
                 {ok, <<"+OK\r\n">>} -> ok;
+                {ok, <<"-ERR Client sent AUTH, but no password is set\r\n">>} -> ok;
                 {ok, Err} -> {error, Err};
                 Err -> Err
             end;
