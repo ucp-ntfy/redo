@@ -203,6 +203,9 @@ handle_call({subscribe, Packet}, {From, _Ref}, State = #state{}) ->
             {reply, {error, closed}, State#state{sock=undefined}, 1000}
     end;
 
+handle_call(reset_password, _, State) ->
+	{reply, ok, State#state{pass = undefined}};
+
 %% state doesn't match. Likely outdated or an error.
 %% Moving from 1.1.0 to here sees the addition of one field
 handle_call(Msg, From, OldState) when 1+tuple_size(OldState) =:= tuple_size(#state{}),
@@ -382,13 +385,13 @@ auth(_Sock, Pass) when Pass == <<>>; Pass == undefined ->
     skip;
 
 auth(Sock, Pass) ->
-    {ok, Opts} = inet:getopts(Sock, [acitve]),
+    {ok, Opts} = inet:getopts(Sock, [active]),
     ok = inet:setopts(Sock, [{active, false}]),
     Result = case gen_tcp:send(Sock, [<<"AUTH ">>, Pass, <<"\r\n">>]) of
         ok ->
             case gen_tcp:recv(Sock, 0) of
                 {ok, <<"+OK\r\n">>} -> ok;
-                {ok, <<"-ERR Client sent AUTH, but no password is set\r\n">>} -> ok;
+                {ok, <<"-ERR Client sent AUTH, but no password is set\r\n">>} -> skip;
                 {ok, Err} -> {error, Err};
                 Err -> Err
             end;
