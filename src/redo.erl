@@ -382,7 +382,9 @@ auth(_Sock, Pass) when Pass == <<>>; Pass == undefined ->
     skip;
 
 auth(Sock, Pass) ->
-    case gen_tcp:send(Sock, [<<"AUTH ">>, Pass, <<"\r\n">>]) of
+    {ok, Opts} = inet:getopts(Sock, [acitve]),
+    ok = inet:setopts(Sock, [{active, false}]),
+    Result = case gen_tcp:send(Sock, [<<"AUTH ">>, Pass, <<"\r\n">>]) of
         ok ->
             case gen_tcp:recv(Sock, 0) of
                 {ok, <<"+OK\r\n">>} -> ok;
@@ -392,7 +394,9 @@ auth(Sock, Pass) ->
             end;
         Err ->
             Err
-    end.
+    end,
+    ok = inet:setopts(Sock, Opts),
+    Result.
 
 get_redis_password() ->
     PassFile = "/usr/local/etc/redis-pass.secret",
