@@ -153,7 +153,8 @@ init([Opts]) ->
 %%--------------------------------------------------------------------
 handle_call({cmd, Packets}, {From, _Ref}, #state{subscriber=undefined, queue=Queue}=State) ->
     case test_connection(State) of
-        State1 when is_record(State1, state) ->
+        StateTmp when is_record(StateTmp, state) ->
+            State1 = auth_on_the_fly(StateTmp),
             %% send each packet to redis
             %% and generate a unique ref per packet
             Refs = lists:foldl(
@@ -188,7 +189,8 @@ handle_call({cmd, _Packets}, _From, State = #state{}) ->
 
 handle_call({subscribe, Packet}, {From, _Ref}, State = #state{}) ->
     case test_connection(State) of
-        State1 when is_record(State1, state) ->
+        StateTmp when is_record(StateTmp, state) ->
+            State1 = auth_on_the_fly(StateTmp),
             case gen_tcp:send(State1#state.sock, Packet) of
                 ok ->
                     Ref = erlang:make_ref(),
@@ -353,6 +355,14 @@ connect(#state{host=Host, port=Port, pass=Pass, db=Db}=State) ->
                     case select_db(Sock, Db) of
                         ok ->
                             inet:setopts(Sock, [{active, once}]),
+                            State#state{sock=Sock, pass=done};
+                        Err ->
+                            Err
+                    end;
+                skip ->
+                    case select_db(Sock, Db) of
+                        ok ->
+                            inet:setopts(Sock, [{active, once}]),
                             State#state{sock=Sock};
                         Err ->
                             Err
@@ -369,7 +379,7 @@ connect_socket(Host, Port) ->
     gen_tcp:connect(Host, Port, SockOpts).
 
 auth(_Sock, Pass) when Pass == <<>>; Pass == undefined ->
-    ok;
+    skip;
 
 auth(Sock, Pass) ->
     case gen_tcp:send(Sock, [<<"AUTH ">>, Pass, <<"\r\n">>]) of
@@ -382,6 +392,23 @@ auth(Sock, Pass) ->
             end;
         Err ->
             Err
+    end.
+
+get_redis_password() ->
+    PassFile = "/usr/local/etc/redis-pass.secret",
+    case file:read_file(PassFile) of
+        {ok, Pass} -> Pass;
+        _ -> undefined
+    end.
+
+auth_on_the_fly(#state{pass = done} = State) ->
+    State;
+auth_on_the_fly(#state{sock = Sock} = State) ->
+    case auth(Sock, get_redis_password()) of
+        ok ->
+            State#state{pass = done};
+        _ ->
+            State
     end.
 
 select_db(_Sock, 0) ->
