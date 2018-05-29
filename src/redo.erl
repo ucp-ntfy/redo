@@ -287,11 +287,11 @@ handle_info({tcp_error, Sock, Reason}, #state{sock=Sock}=State) ->
 
 %% attempt to reconnect to redis
 handle_info(timeout, State = #state{}) ->
-    case connect(State) of
+    case connect(State#state{pass = get_redis_password()}) of
         State1 when is_record(State1, state) ->
             {noreply, State1};
         _Err ->
-            {noreply, State#state{sock=undefined}, 1000}
+            {noreply, State#state{sock=undefined, pass = get_redis_password()}, 1000}
     end;
 
 %% state doesn't match. Likely outdated or an error.
@@ -335,7 +335,7 @@ code_change(_OldVsn, State, _Extra) ->
 init_state(Opts) ->
     Host = proplists:get_value(host, Opts, "localhost"),
     Port = proplists:get_value(port, Opts, 6379),
-    Pass = proplists:get_value(pass, Opts),
+    Pass = proplists:get_value(pass, Opts, get_redis_password()),
     Db   = proplists:get_value(db, Opts, 0),
     Recn = proplists:get_value(reconnect, Opts, true),
     #state{
@@ -438,7 +438,7 @@ select_db(Sock, Db) ->
     end.
 
 test_connection(#state{sock=undefined}=State) ->
-    connect(State);
+    connect(State#state{pass = get_redis_password()});
 
 test_connection(State) ->
     State.
@@ -498,5 +498,6 @@ close_connection(State = #state{queue=Queue}) ->
     State#state{
         queue = queue:new(),
         cancelled = [],
+        pass = get_redis_password(),
         buffer = {raw, <<>>}
     }.
