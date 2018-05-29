@@ -402,10 +402,14 @@ auth(Sock, Pass) ->
     Result.
 
 get_redis_password() ->
-    PassFile = "/usr/local/etc/redis-pass.secret",
-    case file:read_file(PassFile) of
-        {ok, Pass} -> Pass;
-        _ -> undefined
+    case application:get_env(redo, pass_file) of
+        undefined ->
+            undefined;
+        {ok, PassFile} ->
+            case file:read_file(PassFile) of
+                {ok, Pass} -> Pass;
+                _ -> undefined
+            end
     end.
 
 auth_on_the_fly(#state{pass = done} = State) ->
