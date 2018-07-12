@@ -38,6 +38,8 @@
 -define(TIMEOUT, 30000).
 -define(CMD_TIMEOUT, 15000).
 
+-define(AUTH_CMD_REF, auth_cmd_ref).
+
 -spec start_link() -> {ok, pid()} | {error, term()}.
 start_link() ->
     start_link([]).
@@ -153,14 +155,13 @@ init([Opts]) ->
 %%--------------------------------------------------------------------
 handle_call({cmd, Packets}, {From, _Ref}, #state{subscriber=undefined, queue=Queue}=State) ->
     case test_connection(State) of
-        StateTmp when is_record(StateTmp, state) ->
-            State1 = auth_on_the_fly(StateTmp),
+        State1 when is_record(State1, state) ->
             %% send each packet to redis
             %% and generate a unique ref per packet
-            Refs = lists:foldl(
+            RefsCmd = lists:foldl(
                 fun(Packet, Refs) when is_list(Refs) ->
                     case gen_tcp:send(State1#state.sock, Packet) of
-                        ok -> [erlang:make_ref()|Refs];
+                        ok -> [{erlang:make_ref(), Packet}|Refs];
                         Err -> Err
                     end;
                    (_Packet, Err) ->
@@ -168,14 +169,15 @@ handle_call({cmd, Packets}, {From, _Ref}, #state{subscriber=undefined, queue=Que
                 end, [], Packets),
 
             %% enqueue the client pid/refs
-            case Refs of
+            case RefsCmd of
                 List when is_list(List) ->
-                    Refs1 = lists:reverse(Refs),
+                    RefsCmd1 = lists:reverse(RefsCmd),
                     Queue1 = lists:foldl(
-                        fun(Ref, Acc) ->
-                            queue:in({From, Ref}, Acc)
-                        end, Queue, Refs1),
-                    {reply, Refs1, State1#state{queue=Queue1}};
+                        fun({Ref, Cmd}, Acc) ->
+                            queue:in({From, Ref, Cmd}, Acc)
+                        end, Queue, RefsCmd1),
+                    Refs = lists:map(fun({Ref, _}) -> Ref end, RefsCmd1),
+                    {reply, Refs, State1#state{queue=Queue1}};
                 Err ->
                     {stop, Err, State1}
             end;
@@ -189,12 +191,11 @@ handle_call({cmd, _Packets}, _From, State = #state{}) ->
 
 handle_call({subscribe, Packet}, {From, _Ref}, State = #state{}) ->
     case test_connection(State) of
-        StateTmp when is_record(StateTmp, state) ->
-            State1 = auth_on_the_fly(StateTmp),
+        State1 when is_record(State1, state) ->
             case gen_tcp:send(State1#state.sock, Packet) of
                 ok ->
                     Ref = erlang:make_ref(),
-                    {reply, Ref, State1#state{subscriber={From, Ref}}};
+                    {reply, Ref, State1#state{subscriber={From, Ref, Packet}}};
                 Err ->
                     {stop, Err, State1}
             end;
@@ -202,9 +203,6 @@ handle_call({subscribe, Packet}, {From, _Ref}, State = #state{}) ->
             %% failed to connect, retry
             {reply, {error, closed}, State#state{sock=undefined}, 1000}
     end;
-
-handle_call(reset_password, _, State) ->
-	{reply, ok, State#state{pass = undefined}};
 
 %% state doesn't match. Likely outdated or an error.
 %% Moving from 1.1.0 to here sees the addition of one field
@@ -287,11 +285,11 @@ handle_info({tcp_error, Sock, Reason}, #state{sock=Sock}=State) ->
 
 %% attempt to reconnect to redis
 handle_info(timeout, State = #state{}) ->
-    case connect(State#state{pass = get_redis_password()}) of
+    case connect(State) of
         State1 when is_record(State1, state) ->
             {noreply, State1};
         _Err ->
-            {noreply, State#state{sock=undefined, pass = get_redis_password()}, 1000}
+            {noreply, State#state{sock=undefined}, 1000}
     end;
 
 %% state doesn't match. Likely outdated or an error.
@@ -353,23 +351,11 @@ init_state(Opts) ->
 connect(#state{host=Host, port=Port, pass=Pass, db=Db}=State) ->
     case connect_socket(Host, Port) of
         {ok, Sock} ->
-            case auth(Sock, Pass) of
+            auth(Sock, Pass),
+            case select_db(Sock, Db) of
                 ok ->
-                    case select_db(Sock, Db) of
-                        ok ->
-                            inet:setopts(Sock, [{active, once}]),
-                            State#state{sock=Sock, pass=done};
-                        Err ->
-                            Err
-                    end;
-                skip ->
-                    case select_db(Sock, Db) of
-                        ok ->
-                            inet:setopts(Sock, [{active, once}]),
-                            State#state{sock=Sock};
-                        Err ->
-                            Err
-                    end;
+                    inet:setopts(Sock, [{active, once}]),
+                    State#state{sock=Sock};
                 Err ->
                     Err
             end;
@@ -381,25 +367,26 @@ connect_socket(Host, Port) ->
     SockOpts = [binary, {active, false}, {keepalive, true}, {nodelay, true}],
     gen_tcp:connect(Host, Port, SockOpts).
 
-auth(_Sock, Pass) when Pass == <<>>; Pass == undefined ->
-    skip;
-
-auth(Sock, Pass) ->
-    {ok, Opts} = inet:getopts(Sock, [active]),
-    ok = inet:setopts(Sock, [{active, false}]),
-    Result = case gen_tcp:send(Sock, [<<"AUTH ">>, Pass, <<"\r\n">>]) of
-        ok ->
-            case gen_tcp:recv(Sock, 0) of
-                {ok, <<"+OK\r\n">>} -> ok;
-                {ok, <<"-ERR Client sent AUTH, but no password is set\r\n">>} -> skip;
-                {ok, Err} -> {error, Err};
-                Err -> Err
-            end;
-        Err ->
-            Err
-    end,
-    ok = inet:setopts(Sock, Opts),
-    Result.
+auth(Sock, _Pass) ->
+    case auth_cmd() of
+        undefined -> skip;
+        AuthCmd ->
+            {ok, Opts} = inet:getopts(Sock, [active]),
+            ok = inet:setopts(Sock, [{active, false}]),
+            Result = case gen_tcp:send(Sock, AuthCmd) of
+                ok ->
+                    case gen_tcp:recv(Sock, 0) of
+                        {ok, <<"+OK\r\n">>} -> ok;
+                        {ok, <<"-ERR Client sent AUTH, but no password is set\r\n">>} -> skip;
+                        {ok, Err} -> {error, Err};
+                        Err -> Err
+                    end;
+                Err ->
+                    Err
+            end,
+            ok = inet:setopts(Sock, Opts),
+            Result
+    end.
 
 get_redis_password() ->
     case application:get_env(redo, pass_file) of
@@ -412,14 +399,12 @@ get_redis_password() ->
             end
     end.
 
-auth_on_the_fly(#state{pass = done} = State) ->
-    State;
-auth_on_the_fly(#state{sock = Sock} = State) ->
-    case auth(Sock, get_redis_password()) of
-        ok ->
-            State#state{pass = done};
-        _ ->
-            State
+auth_cmd() ->
+    case get_redis_password() of
+        undefined ->
+            undefined;
+        Pass ->
+            [<<"AUTH ">>, Pass, <<"\r\n">>]
     end.
 
 select_db(_Sock, 0) ->
@@ -438,7 +423,7 @@ select_db(Sock, Db) ->
     end.
 
 test_connection(#state{sock=undefined}=State) ->
-    connect(State#state{pass = get_redis_password()});
+    connect(State);
 
 test_connection(State) ->
     State.
@@ -450,10 +435,14 @@ process_packet(#state{acc=Acc, queue=Queue, subscriber=Subscriber}=State, Packet
             case queue:out(Queue) of
                 {{value, {Pid, Ref}}, Queue1} ->
                     send_response(Pid, Ref, Result, Rest, State, Queue1);
+                {{value, {Pid, Ref, Cmd}}, Queue1} ->
+                    handle_response(Pid, Ref, Cmd, Result, Rest, State, Queue1);
                 {empty, Queue1} ->
                     case Subscriber of
                         {Pid, Ref} ->
                             send_response(Pid, Ref, Result, Rest, State, Queue1);
+                        {Pid, Ref, Cmd} ->
+                            handle_response(Pid, Ref, Cmd, Result, Rest, State, Queue1);
                         undefined ->
                             {error, queue_empty}
                     end
@@ -464,8 +453,37 @@ process_packet(#state{acc=Acc, queue=Queue, subscriber=Subscriber}=State, Packet
             {ok, State#state{acc=Acc1, buffer=Rest}}
     end.
 
+handle_response(_Pid, ?AUTH_CMD_REF, _Cmd, _Result, Rest, State, Queue) ->
+    process_rest_response_data(Rest, State, Queue);
+handle_response(Pid, Ref, Cmd, Result, Rest, State, Queue) ->
+    case Result of
+        {error, <<"NOAUTH ", _/binary>>} ->
+            Queue1 = case auth_cmd() of
+                undefined ->
+                    Queue;
+                AuthCmd ->
+                    case gen_tcp:send(State#state.sock, AuthCmd) of
+                        ok ->
+                            queue:in({self(), ?AUTH_CMD_REF, AuthCmd}, Queue);
+                        _ ->
+                            Queue
+                    end
+            end,
+            case gen_tcp:send(State#state.sock, Cmd) of
+                ok ->
+                    process_rest_response_data(Rest, State, queue:in({Pid, Ref, Cmd}, Queue1));
+                Err ->
+                    Err
+            end;
+        _ ->
+            send_response(Pid, Ref, Result, Rest, State, Queue)
+    end.
+
 send_response(Pid, Ref, Result, Rest, State, Queue) ->
     Pid ! {Ref, Result},
+    process_rest_response_data(Rest, State, Queue).
+
+process_rest_response_data(Rest, State, Queue) ->
     case Rest of
         {raw, <<>>} ->
             %% we have reached the end of this tcp packet
@@ -487,10 +505,12 @@ close_connection(State = #state{queue=Queue}) ->
     %% notify all waiting pids that the connection is closed
     %% so that they may try resending their requests
     [Pid ! {Ref, closed} || {Pid, Ref} <- queue:to_list(Queue)],
+    [Pid ! {Ref, closed} || {Pid, Ref, _Cmd} <- queue:to_list(Queue)],
 
     %% notify subscriber pid of disconnect
     case State#state.subscriber of
         {Pid, Ref} -> Pid ! {Ref, closed};
+        {Pid, Ref, _Cmd} -> Pid ! {Ref, closed};
         _ -> ok
     end,
 
@@ -498,6 +518,5 @@ close_connection(State = #state{queue=Queue}) ->
     State#state{
         queue = queue:new(),
         cancelled = [],
-        pass = get_redis_password(),
         buffer = {raw, <<>>}
     }.
